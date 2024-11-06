@@ -2,13 +2,15 @@
 pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Counters.sol";
 
 contract P2PHTLCSwap is ReentrancyGuard {
     using Counters for Counters.Counter;
     Counters.Counter private _orderIds;
-    
+
+    uint64 public _swapIds = 0; 
+
     struct Order {
         uint256 orderId;
         address maker;
@@ -25,7 +27,7 @@ contract P2PHTLCSwap is ReentrancyGuard {
     }
     
     struct Swap {
-        bytes32 swapId;
+        uint256 swapId;
         uint256 orderId;
         address initiator;       // Order maker
         address participant;     // Order taker
@@ -48,12 +50,14 @@ contract P2PHTLCSwap is ReentrancyGuard {
     
     // Main storage
     mapping(uint256 => Order) public orders;
-    mapping(bytes32 => Swap) public swaps;
+    mapping(uint256 => Swap) public swaps;
     
     // Order book organization
     mapping(address => mapping(address => uint256[])) public orderBook;  // tokenA => tokenB => orderIds
     mapping(address => uint256[]) public userOrders;  // user => their orderIds
     
+    //order to swap
+    mapping(uint256 => uint256[]) public orderToSwap;
     // Events
     event OrderCreated(
         uint256 indexed orderId,
@@ -68,15 +72,15 @@ contract P2PHTLCSwap is ReentrancyGuard {
     event OrderUpdated(uint256 indexed orderId);
     
     event SwapInitiated(
-        bytes32 indexed swapId,
+        uint256 indexed swapId,
         uint256 indexed orderId,
         address indexed participant,
         uint256 initiatorAmount,
         uint256 participantAmount
     );
     
-    event SwapCompleted(bytes32 indexed swapId);
-    event SwapRefunded(bytes32 indexed swapId);
+    event SwapCompleted(uint256 indexed swapId);
+    event SwapRefunded(uint256 indexed swapId);
     
     // Modifiers
     modifier onlyOrderMaker(uint256 orderId) {
@@ -89,7 +93,7 @@ contract P2PHTLCSwap is ReentrancyGuard {
         _;
     }
     
-    modifier swapExists(bytes32 swapId) {
+    modifier swapExists(uint256 swapId) {
         require(swaps[swapId].status != SwapStatus.INVALID, "Swap does not exist");
         _;
     }
@@ -104,13 +108,12 @@ contract P2PHTLCSwap is ReentrancyGuard {
         uint256 _maxTradeAmount,
         bool _partialFillAllowed,
         uint256 _timelock
-    ) external nonReentrant returns (uint256) {
+    ) external nonReentrant payable returns (uint256) {
         require(_timelock > block.timestamp, "Invalid timelock");
         require(_amountToSell > 0 && _amountToBuy > 0, "Invalid amounts");
         require(_minTradeAmount <= _maxTradeAmount, "Invalid trade limits");
         require(_maxTradeAmount <= _amountToSell, "Max trade exceeds total");
         
-        _orderIds.increment();
         uint256 orderId = _orderIds.current();
         
         // Lock tokens
@@ -142,6 +145,7 @@ contract P2PHTLCSwap is ReentrancyGuard {
         // Add to order book
         orderBook[_tokenToSell][_tokenToBuy].push(orderId);
         userOrders[msg.sender].push(orderId);
+        _orderIds.increment();
         
         emit OrderCreated(
             orderId,
@@ -160,11 +164,11 @@ contract P2PHTLCSwap is ReentrancyGuard {
         uint256 takeAmount,
         bytes32 hashlock,
         uint256 timelock
-    ) external payable nonReentrant returns (bytes32) {
+    ) external payable nonReentrant{
         Order storage order = orders[orderId];
         require(order.isActive, "Order not active");
         require(block.timestamp < order.timelock, "Order expired");
-        require(msg.sender != order.maker, "Cannot swap with self");
+        // require(msg.sender != order.maker, "Cannot swap with self");
         require(timelock < order.timelock, "Swap timelock exceeds order");
         require(takeAmount >= order.minTradeAmount, "Below min trade");
         require(takeAmount <= order.maxTradeAmount, "Exceeds max trade");
@@ -183,14 +187,7 @@ contract P2PHTLCSwap is ReentrancyGuard {
         }
         
         // Create swap
-        bytes32 swapId = keccak256(abi.encodePacked(
-            orderId,
-            msg.sender,
-            takeAmount,
-            giveAmount,
-            hashlock,
-            block.timestamp
-        ));
+        uint256 swapId = _swapIds;
         
         swaps[swapId] = Swap({
             swapId: swapId,
@@ -207,17 +204,18 @@ contract P2PHTLCSwap is ReentrancyGuard {
         });
         
         // Update order
-        order.activeSwaps.push(swapId);
+        orderToSwap[orderId].push(swapId);
+
         if(!order.partialFillAllowed || takeAmount == order.amountToSell) {
             order.isActive = false;
         }
+        _swapIds++;
         
         emit SwapInitiated(swapId, orderId, msg.sender, takeAmount, giveAmount);
         
-        return swapId;
     }
     
-    function completeSwap(bytes32 swapId, bytes32 preimage) external nonReentrant swapExists(swapId) {
+    function completeSwap(uint256 swapId, bytes32 preimage) external nonReentrant swapExists(swapId) {
         Swap storage swap = swaps[swapId];
         require(swap.status == SwapStatus.ACTIVE, "Invalid swap status");
         require(block.timestamp < swap.timelock, "Swap expired");
@@ -239,7 +237,7 @@ contract P2PHTLCSwap is ReentrancyGuard {
         emit SwapCompleted(swapId);
     }
     
-    function refundSwap(bytes32 swapId) external nonReentrant swapExists(swapId) {
+    function refundSwap(uint256 swapId) external nonReentrant swapExists(swapId) {
         Swap storage swap = swaps[swapId];
         require(swap.status == SwapStatus.ACTIVE, "Invalid swap status");
         require(block.timestamp >= swap.timelock, "Timelock not expired");
@@ -297,13 +295,14 @@ contract P2PHTLCSwap is ReentrancyGuard {
     }
     
     function removeFromOrderBook(address tokenA, address tokenB, uint256 orderId) internal {
-        uint256[] storage orders = orderBook[tokenA][tokenB];
-        for(uint i = 0; i < orders.length; i++) {
-            if(orders[i] == orderId) {
-                orders[i] = orders[orders.length - 1];
-                orders.pop();
+        uint256[] storage allOrders = orderBook[tokenA][tokenB];
+        for(uint i = 0; i < allOrders.length; i++) {
+            if(allOrders[i] == orderId) {
+                allOrders[i] = allOrders[allOrders.length - 1];
+                allOrders.pop();
                 break;
             }
         }
+        orderBook[tokenA][tokenB] = allOrders;
     }
 }
