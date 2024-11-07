@@ -2,7 +2,7 @@
 pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Counters.sol";
 
 contract P2PHTLCSwap is ReentrancyGuard {
@@ -21,7 +21,8 @@ contract P2PHTLCSwap is ReentrancyGuard {
         uint256 minTradeAmount;  // Minimum trade size
         uint256 maxTradeAmount;  // Maximum trade size
         bool partialFillAllowed;
-        uint256 timelock;        // Order expiry
+        uint256 timelock; 
+        bytes32 hashlock;
         bool isActive;
         bytes32[] activeSwaps;   // Track all active swaps for this order
     }
@@ -83,8 +84,9 @@ contract P2PHTLCSwap is ReentrancyGuard {
     event SwapRefunded(uint256 indexed swapId);
     
     // Modifiers
-    modifier onlyOrderMaker(uint256 orderId) {
-        require(orders[orderId].maker == msg.sender, "Not order maker");
+    modifier onlyOrderMaker(uint256 swapId) {
+        uint256 _orderId = swaps[swapId].orderId;
+        require(orders[_orderId].maker == msg.sender, "Not order maker");
         _;
     }
     
@@ -107,7 +109,8 @@ contract P2PHTLCSwap is ReentrancyGuard {
         uint256 _minTradeAmount,
         uint256 _maxTradeAmount,
         bool _partialFillAllowed,
-        uint256 _timelock
+        uint256 _timelock,
+        string  memory _preImage
     ) external nonReentrant payable returns (uint256) {
         require(_timelock > block.timestamp, "Invalid timelock");
         require(_amountToSell > 0 && _amountToBuy > 0, "Invalid amounts");
@@ -125,7 +128,8 @@ contract P2PHTLCSwap is ReentrancyGuard {
                 "Token transfer failed"
             );
         }
-        
+        bytes32 secret = keccak256(abi.encodePacked(_preImage));
+
         // Create order
         orders[orderId] = Order({
             orderId: orderId,
@@ -138,6 +142,7 @@ contract P2PHTLCSwap is ReentrancyGuard {
             maxTradeAmount: _maxTradeAmount,
             partialFillAllowed: _partialFillAllowed,
             timelock: _timelock,
+            hashlock:secret,
             isActive: true,
             activeSwaps: new bytes32[](0)
         });
@@ -215,7 +220,7 @@ contract P2PHTLCSwap is ReentrancyGuard {
         
     }
     
-    function completeSwap(uint256 swapId, bytes32 preimage) external nonReentrant swapExists(swapId) {
+    function completeSwap(uint256 swapId, string memory preimage) external nonReentrant swapExists(swapId) onlyOrderMaker(swapId) {
         Swap storage swap = swaps[swapId];
         require(swap.status == SwapStatus.ACTIVE, "Invalid swap status");
         require(block.timestamp < swap.timelock, "Swap expired");
